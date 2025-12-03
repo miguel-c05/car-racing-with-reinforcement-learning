@@ -1,4 +1,5 @@
 import gymnasium as gym
+import stable_baselines3 as sb3
 
 # Try to load the environment to verify Box2D is working
 try:
