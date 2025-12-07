@@ -2,6 +2,10 @@ import config as cfg
 import gymnasium as gym
 from gymnasium.envs.box2d.car_racing import CarRacing
 from gymnasium.envs.box2d.car_dynamics import Car
+import stable_baselines3 as sb3
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.monitor import Monitor
 import numpy as np
 import cv2
 
@@ -12,7 +16,6 @@ class CustomEnvironment(gym.Wrapper):
         wiggle_penalty=cfg.WIGGLE_PENALTY,
         wiggle_tolerance=cfg.WIGGLE_TOLERANCE,
         off_road_wheel_penalty=cfg.OFF_ROAD_WHEEL_PENALTY,
-        draw_optimal_line=True, # New Flag
         verbose=False
     ):
         super().__init__(env)
@@ -20,7 +23,6 @@ class CustomEnvironment(gym.Wrapper):
         self.wiggle_penalty = wiggle_penalty
         self.wiggle_tolerance = wiggle_tolerance
         self.off_road_wheel_penalty = off_road_wheel_penalty
-        self.draw_optimal_line = draw_optimal_line
         self.verbose = verbose
         
         # State tracking
@@ -41,10 +43,6 @@ class CustomEnvironment(gym.Wrapper):
         # 3. Reset internal state
         self.last_action = np.array([0.0, 0.0, 0.0])
         self.info["consecutive_off_road"] = 0
-        
-        # 4. Optional: Draw the line on the very first frame
-        if self.draw_optimal_line:
-            obs = self.render_optimal_line(obs)
             
         return obs, info
     
@@ -110,105 +108,18 @@ class CustomEnvironment(gym.Wrapper):
 
         return optimized_path
     
-    def render_optimal_line(self, observation):
-        """ Draws the optimal line on the frame so the CNN can see it. """
-        if self.optimal_line is None: return observation
+    def get_line_distance_and_angle_diff(self):
+        """
+        Returns both the minimum distance to the optimal line and the angle difference
+        between car direction and the tangent of the closest segment.
         
+        Returns:
+            line_distance: minimum distance to optimal line (float)
+            angle_diff: angle difference in radians between car velocity and tangent (float)
+                       ranges from 0 (aligned) to π (opposite direction)
+        """
         car = self.env.unwrapped.car
-        img = observation.copy() # Don't mutate original if possible
-        
-        # Constants for coordinate transformation
-        WINDOW_W, WINDOW_H = 600, 400
-        SCALE = 6.0
-        
-        # Optimize: Only transform points near the car to save FPS
-        # (For simplicity here, we transform all, but in production you'd clip)
-        
-        screen_points = []
-        for point in self.optimal_line:
-            x, y = point
-            screen_x = int(WINDOW_W / 2 + (x - car.hull.position.x) * SCALE)
-            screen_y = int(WINDOW_H / 2 + (y - car.hull.position.y) * SCALE)
-            
-            # Simple bounds check to avoid drawing off-canvas
-            if -100 < screen_x < 700 and -100 < screen_y < 500:
-                screen_points.append((screen_x, screen_y))
-        
-        if len(screen_points) > 1:
-            # Draw green line, thickness 1
-            cv2.polylines(img, [np.array(screen_points)], isClosed=True, color=(0, 255, 0), thickness=1)
-            
-        return img
-    
-    def plot_optimal_line(self, observation, optimal_path=None, color=(0, 255, 0), thickness=1):
-        """
-        Plots the optimal racing line on the 96x96 agent observation.
-        """
-        # 1. Fallback: Use the cached line if none is provided
-        if optimal_path is None:
-            optimal_path = self.optimal_line
-        
-        # If we still don't have a path (e.g., before reset), return original image
-        if optimal_path is None: 
-            return observation
-        
-        # 2. Setup Coordinate System for 96x96 Observation
-        # The agent sees a 96x96 crop centered roughly on the car.
-        img = observation.copy()
-        
-        # CarRacing-v2 constants for the 96x96 view
-        # The car is always centered in the middle of the 96x96 image
-        OBS_W, OBS_H = 96, 96
-        CENTER_X, CENTER_Y = 48, 48 
-        
-        # SCALE: This is "Pixels per Box2D World Unit"
-        # In the 96x96 observation, the zoom level is approx 6.0 (Standard Box2D scale)
-        SCALE = 6.0 
-        
-        # 3. Get Car Position (The "Camera Center")
-        # We need the car's position to know where to shift the world points
-        car_pos = self.env.unwrapped.car.hull.position
-        
-        # 4. Transform World Coordinates to Screen Coordinates
-        screen_points = []
-        
-        # Optimization: Only process points roughly near the car 
-        # (World is 1000x1000, we only see a 16x16 patch)
-        # We assume coordinates are within ~15 units to be visible
-        
-        for point in optimal_path:
-            x, y = point
-            
-            # Calculate distance from car to point
-            diff_x = x - car_pos.x
-            diff_y = y - car_pos.y
-            
-            # Quick check: Is the point even close to the camera? (Optimization)
-            if abs(diff_x) > 20 or abs(diff_y) > 20:
-                continue
-
-            # Transform:
-            # 1. Shift world so car is at (0,0) -> (diff_x, diff_y)
-            # 2. Scale up to pixels -> (diff_x * SCALE)
-            # 3. Shift to screen center -> (+ CENTER_X)
-            screen_x = int(CENTER_X + diff_x * SCALE)
-            screen_y = int(CENTER_Y - diff_y * SCALE) # SUBTRACT Y because pixels go down, world goes up
-            
-            # Add to list if it fits on screen
-            if 0 <= screen_x < OBS_W and 0 <= screen_y < OBS_H:
-                screen_points.append((screen_x, screen_y))
-        
-        # 5. Draw
-        if len(screen_points) > 1:
-            # We use polylines to draw connected segments
-            # Note: cv2 expects a list of arrays of points
-            points_array = np.array([screen_points], dtype=np.int32)
-            cv2.polylines(img, points_array, isClosed=False, color=color, thickness=thickness)
-            
-        return img
-    
-    def get_line_distance(self):
-        car_pos = np.array(self.env.unwrapped.car.hull.position, dtype=np.float32)
+        car_pos = np.array(car.hull.position, dtype=np.float32)
         
         # 1. Define the segments
         # Points A are the current path points
@@ -218,7 +129,7 @@ class CustomEnvironment(gym.Wrapper):
         B = np.roll(self.optimal_line, -1, axis=0) # Shift entire array by -1 to get next points
         
         # 2. Vectors
-        AB = B - A              # Vector of the road segment
+        AB = B - A              # Vector of the road segment (tangent vectors)
         AP = car_pos - A        # Vector from segment start to car
         
         # 3. Project AP onto AB to find "t"
@@ -243,8 +154,32 @@ class CustomEnvironment(gym.Wrapper):
         diff = car_pos - C
         dists = np.linalg.norm(diff, axis=1)
         
-        # 7. The absolute minimum distance across all segments
-        return np.min(dists)
+        # 7. Find the index of the closest segment
+        closest_idx = np.argmin(dists)
+        line_distance = dists[closest_idx]
+        
+        # 8. Calculate angle difference between car velocity and tangent
+        car_vel = car.hull.linearVelocity
+        car_direction = np.array([car_vel.x, car_vel.y], dtype=np.float32)
+        car_speed = np.linalg.norm(car_direction)
+        
+        # If car is not moving, return 0 angle difference
+        if car_speed < 0.1:
+            return line_distance, 0.0
+        
+        # Normalize car direction
+        car_direction_norm = car_direction / car_speed
+        
+        # Get tangent of closest segment and normalize
+        tangent = AB[closest_idx]
+        tangent_norm = tangent / np.linalg.norm(tangent)
+        
+        # Calculate angle difference using arccos of dot product
+        # Clamp to [-1, 1] to avoid numerical errors
+        dot_product = np.clip(np.dot(car_direction_norm, tangent_norm), -1.0, 1.0)
+        angle_diff = np.arccos(dot_product)
+        
+        return line_distance, angle_diff
     
     def line_distance_reward_function(self,
         line_distance : float,
@@ -258,6 +193,14 @@ class CustomEnvironment(gym.Wrapper):
         
         return f
     
+    def line_angle_diff_reward_function(self,
+        angle_diff : float,
+        max_reward = cfg.MAX_ANGLE_DIFF_REWARD,
+        dropoff = cfg.ANGLE_DIFF_REWARD_DROPOFF,
+    ):
+        f = max_reward * np.exp(- (angle_diff ** 2) / (2 * (dropoff ** 2)))
+        return f
+    
     def step(self, action):
         # Note: 'last_action' removed from arguments to match Gym API
         
@@ -266,19 +209,15 @@ class CustomEnvironment(gym.Wrapper):
         if hasattr(info, "lap_finished"):
             self.info["lap_finished"] = info["lap_finished"]
 
-        # --- OPTIONAL: VISUAL GUIDANCE ---
-        if self.draw_optimal_line:
-            observation = self.render_optimal_line(observation)
-
-        # ------------------
-        #      GAS BIAS
-        # ------------------
+        # ----------------------------------------
+        #                GAS BIAS
+        # ----------------------------------------
         gas = action[1]
         reward += gas * self.gas_reward
         
-        # ------------------
-        # WIGGLE PROTECTION
-        # ------------------
+        # ----------------------------------------
+        #            WIGGLE PROTECTION
+        # ----------------------------------------
         current_steering = action[0]
         last_steering = self.last_action[0] # Use internal state
         wiggle = current_steering - last_steering
@@ -289,20 +228,27 @@ class CustomEnvironment(gym.Wrapper):
         # Update state for next frame
         self.last_action = action 
         
-        # -----------------------------
-        # OPTIMAL LINE CLOSENESS REWARD
-        # -----------------------------
-        line_distance = self.get_line_distance()
-        
-        # Use numpy for generic vector calculation
+        line_distance, angle_diff = self.get_line_distance_and_angle_diff()
         car_vel = self.env.unwrapped.car.hull.linearVelocity
         car_speed = np.linalg.norm([car_vel.x, car_vel.y])
         
+        # ======== PID REWARD COMPONENTS =========
+        
+        # ----------------------------------------
+        # OPTIMAL LINE CLOSENESS REWARD (P Factor)
+        # ----------------------------------------
         reward += self.line_distance_reward_function(line_distance, car_speed)
         
-        # ----------------
-        # EARLY STOP LOGIC
-        # ----------------
+        # ----------------------------------------
+        # OPTIMAL ORIENTATION REWARD (D Factor)
+        # ----------------------------------------
+        reward += self.line_angle_diff_reward_function(angle_diff)
+        
+        # ========================================
+        
+        # ----------------------------------------
+        #            EARLY STOP LOGIC
+        # ----------------------------------------
         wheels_on_road = self.check_early_stop(self.env)
         self.info["wheels_on_road"] = wheels_on_road
         
@@ -316,6 +262,10 @@ class CustomEnvironment(gym.Wrapper):
             # Optional: Add a large penalty for giving up
             reward -= 5.0
         
+        
+        # ----------------------------------------
+        #         OFF-ROAD WHEEL PENALTY
+        # ----------------------------------------
         reward -= (4 - wheels_on_road) * self.off_road_wheel_penalty
         
         return observation, reward, done, truncated, self.info
@@ -327,7 +277,7 @@ if __name__ == "__main__":
     env = gym.make("CarRacing-v3", render_mode="rgb_array")
     
     # Wrap it
-    env = CustomEnvironment(env, draw_optimal_line=True, verbose=True)
+    env = CustomEnvironment(env, verbose=True)
     
     obs, _ = env.reset()
     print("Environment reset. Generating optimal line...")
@@ -341,17 +291,10 @@ if __name__ == "__main__":
             # Step the environment
             obs, reward, terminated, truncated, info = env.step(action)
             
-            # --- VISUALIZATION ---
-            # Gymnasium returns RGB, OpenCV needs BGR
-            display_img = cv2.cvtColor(obs, cv2.COLOR_RGB2BGR)
-            
-            # Upscale the 96x96 image to 500x500 so we can actually see it
-            display_img = cv2.resize(display_img, (500, 500), interpolation=cv2.INTER_NEAREST)
-            
-            cv2.imshow("Agent View (Green Line = Optimal)", display_img)
-            
-            # Check for Quit (Press 'q')
-            if cv2.waitKey(20) & 0xFF == ord('q'):
+            # Render the environment
+            frame = env.render()
+            cv2.imshow("CarRacing-v3", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
             
             # Reset if episode ends
@@ -363,4 +306,23 @@ if __name__ == "__main__":
         print("\nStoppping...")
     finally:
         env.close()
-        cv2.destroyAllWindows()
+        
+def make_custom_env(seed=0, render_mode="rgb_array"):
+    env = gym.make("CarRacing-v3", render_mode=render_mode)
+    custom_env = CustomEnvironment(env)
+    custom_env = Monitor(custom_env)
+    
+    custom_env.reset(seed=seed)
+    
+    return custom_env
+
+def make_vec_envs(num_envs=4, seed=0):
+    vec_env = make_vec_env(
+        make_custom_env,
+        n_envs=num_envs,
+        vec_env_cls= SubprocVecEnv
+    )
+    
+    vec_env.reset(seed=seed)
+    
+    return vec_env
