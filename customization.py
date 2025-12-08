@@ -32,6 +32,18 @@ class CustomEnvironment(gym.Wrapper):
         self.info = {}
         self.info["wheels_on_road"] = 4
         self.info["consecutive_off_road"] = 0
+
+        # --- CORREÇÃO IMPORTANTE ---
+        # Como vamos cortar a imagem, precisamos atualizar o observation_space
+        # O original é (96, 96, 3). Vamos remover 12 pixels de baixo, ficando (84, 96, 3).
+        original_shape = self.env.observation_space.shape
+        new_height = 84
+        self.observation_space = gym.spaces.Box(
+            low=0, 
+            high=255, 
+            shape=(new_height, original_shape[1], original_shape[2]), 
+            dtype=np.uint8
+        )
     
     def reset(self, **kwargs):
         # 1. Reset the simulation
@@ -43,6 +55,9 @@ class CustomEnvironment(gym.Wrapper):
         # 3. Reset internal state
         self.last_action = np.array([0.0, 0.0, 0.0])
         self.info["consecutive_off_road"] = 0
+        
+        # 4. Aplica o corte na observação inicial
+        obs = self.remove_observation_hud(obs)
             
         return obs, info
     
@@ -53,9 +68,6 @@ class CustomEnvironment(gym.Wrapper):
         for wheel in car.wheels:
             if len(wheel.tiles) > 0:
                 wheels_on_road += 1
-        if self.verbose:
-            if wheels_on_road == 0: print("Car off road!")
-            else: print("Wheels on road:", wheels_on_road)
         
         return wheels_on_road
     
@@ -112,19 +124,11 @@ class CustomEnvironment(gym.Wrapper):
         """
         Returns both the minimum distance to the optimal line and the angle difference
         between car direction and the tangent of the closest segment.
-        
-        Returns:
-            line_distance: minimum distance to optimal line (float)
-            angle_diff: angle difference in radians between car velocity and tangent (float)
-                       ranges from 0 (aligned) to π (opposite direction)
         """
         car = self.env.unwrapped.car
         car_pos = np.array(car.hull.position, dtype=np.float32)
         
         # 1. Define the segments
-        # Points A are the current path points
-        # Points B are the next points (shifted by 1)
-        # We assume self.optimal_path is shape (N, 2)
         A = self.optimal_line
         B = np.roll(self.optimal_line, -1, axis=0) # Shift entire array by -1 to get next points
         
@@ -133,21 +137,16 @@ class CustomEnvironment(gym.Wrapper):
         AP = car_pos - A        # Vector from segment start to car
         
         # 3. Project AP onto AB to find "t"
-        # Dot product of (N, 2) arrays along axis 1
         dot_prod = np.sum(AP * AB, axis=1)
-        
-        # Squared length of AB (avoid sqrt for speed)
         ab_len_sq = np.sum(AB**2, axis=1)
         
-        # Avoid division by zero (just in case of duplicate points)
-        # If segment length is 0, t doesn't matter (closest is just A)
+        # Avoid division by zero
         t = np.divide(dot_prod, ab_len_sq, out=np.zeros_like(dot_prod), where=ab_len_sq!=0)
         
         # 4. Clamp t to segment bounds [0, 1]
         t = np.clip(t, 0.0, 1.0)
         
         # 5. Calculate the closest point C on the segment
-        # We need to reshape t from (N,) to (N, 1) for broadcasting
         C = A + (AB * t[:, np.newaxis])
         
         # 6. Euclidean distance from Car P to Closest Point C
@@ -163,19 +162,13 @@ class CustomEnvironment(gym.Wrapper):
         car_direction = np.array([car_vel.x, car_vel.y], dtype=np.float32)
         car_speed = np.linalg.norm(car_direction)
         
-        # If car is not moving, return 0 angle difference
         if car_speed < 0.1:
             return line_distance, 0.0
         
-        # Normalize car direction
         car_direction_norm = car_direction / car_speed
-        
-        # Get tangent of closest segment and normalize
         tangent = AB[closest_idx]
         tangent_norm = tangent / np.linalg.norm(tangent)
         
-        # Calculate angle difference using arccos of dot product
-        # Clamp to [-1, 1] to avoid numerical errors
         dot_product = np.clip(np.dot(car_direction_norm, tangent_norm), -1.0, 1.0)
         angle_diff = np.arccos(dot_product)
         
@@ -201,9 +194,25 @@ class CustomEnvironment(gym.Wrapper):
         f = max_reward * np.exp(- (angle_diff ** 2) / (2 * (dropoff ** 2)))
         return f
     
+    def remove_observation_hud(self, observation):
+        """
+        Removes the dashboard (HUD) from the bottom of the observation.
+        The CarRacing-v3 HUD is 12 pixels high.
+        Original: (96, 96, 3) -> Cropped: (84, 96, 3)
+        """
+        # Se for None (pode acontecer em resets quebrados), retorna None
+        if observation is None:
+            return None
+            
+        # Handle batched input (N_Envs, Height, Width, Channels)
+        if len(observation.shape) == 4:
+            return observation[:, :84, :, :]
+        # Handle single input (Height, Width, Channels)
+        elif len(observation.shape) == 3:
+            return observation[:84, :, :]
+        return observation
+    
     def step(self, action):
-        # Note: 'last_action' removed from arguments to match Gym API
-        
         observation, reward, done, truncated, info = self.env.step(action)
         
         if hasattr(info, "lap_finished"):
@@ -219,13 +228,12 @@ class CustomEnvironment(gym.Wrapper):
         #            WIGGLE PROTECTION
         # ----------------------------------------
         current_steering = action[0]
-        last_steering = self.last_action[0] # Use internal state
+        last_steering = self.last_action[0]
         wiggle = current_steering - last_steering
         
         if abs(wiggle) > self.wiggle_tolerance:
             reward -= abs(wiggle) * self.wiggle_penalty
         
-        # Update state for next frame
         self.last_action = action 
         
         line_distance, angle_diff = self.get_line_distance_and_angle_diff()
@@ -233,18 +241,8 @@ class CustomEnvironment(gym.Wrapper):
         car_speed = np.linalg.norm([car_vel.x, car_vel.y])
         
         # ======== PID REWARD COMPONENTS =========
-        
-        # ----------------------------------------
-        # OPTIMAL LINE CLOSENESS REWARD (P Factor)
-        # ----------------------------------------
         reward += self.line_distance_reward_function(line_distance, car_speed)
-        
-        # ----------------------------------------
-        # OPTIMAL ORIENTATION REWARD (D Factor)
-        # ----------------------------------------
         reward += self.line_angle_diff_reward_function(angle_diff)
-        
-        # ========================================
         
         # ----------------------------------------
         #            EARLY STOP LOGIC
@@ -259,41 +257,49 @@ class CustomEnvironment(gym.Wrapper):
         
         if self.info["consecutive_off_road"] > cfg.MAX_OFF_ROAD_STEPS:
             truncated = True
-            # Optional: Add a large penalty for giving up
             reward -= 5.0
-        
         
         # ----------------------------------------
         #         OFF-ROAD WHEEL PENALTY
         # ----------------------------------------
         reward -= (4 - wheels_on_road) * self.off_road_wheel_penalty
         
-        return observation, reward, done, truncated, self.info
+        # Aplica o corte
+        clean_observation = self.remove_observation_hud(observation)
+        
+        return clean_observation, reward, done, truncated, self.info
 
 if __name__ == "__main__":
     print("Initializing CarRacing-v3...")
     
-    # render_mode='rgb_array' is required to get the pixels for OpenCV
+    # render_mode='rgb_array' ainda é necessário para o backend funcionar, 
+    # mas não usaremos o 'render()' para visualização direta
     env = gym.make("CarRacing-v3", render_mode="rgb_array")
     
     # Wrap it
-    env = CustomEnvironment(env, verbose=True)
+    env = CustomEnvironment(env)
     
     obs, _ = env.reset()
-    print("Environment reset. Generating optimal line...")
+    print(f"Environment reset. Observation shape: {obs.shape}") # Deve ser (84, 96, 3)
     
     try:
         while True:
             # Action: [Steering, Gas, Brake]
-            # Simple policy: Drive forward slowly
             action = np.array([0.0, 0.2, 0.0])
             
             # Step the environment
             obs, reward, terminated, truncated, info = env.step(action)
             
-            # Render the environment
-            frame = env.render()
-            cv2.imshow("CarRacing-v3", frame)
+            # --- VISUALIZAÇÃO DO AGENTE (CORTADA) ---
+            # 'obs' é o que o agente vê. O Gym retorna RGB, mas o OpenCV usa BGR.
+            # Precisamos converter para as cores ficarem certas na janela.
+            frame_agent = cv2.cvtColor(obs, cv2.COLOR_RGB2BGR)
+            
+            # Upscale the image for better visualization
+            frame_agent_upscaled = cv2.resize(frame_agent, (480, 420), interpolation=cv2.INTER_NEAREST)
+            
+            cv2.imshow("Agent View (Cropped)", frame_agent_upscaled)
+            
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
             
@@ -303,26 +309,23 @@ if __name__ == "__main__":
                 obs, _ = env.reset()
                 
     except KeyboardInterrupt:
-        print("\nStoppping...")
+        print("\nStopping...")
     finally:
         env.close()
+        cv2.destroyAllWindows()
         
-def make_custom_env(seed=0, render_mode="rgb_array"):
+def make_custom_env(render_mode="rgb_array"):
     env = gym.make("CarRacing-v3", render_mode=render_mode)
     custom_env = CustomEnvironment(env)
     custom_env = Monitor(custom_env)
-    
-    custom_env.reset(seed=seed)
-    
+    custom_env.reset()
     return custom_env
 
-def make_vec_envs(num_envs=4, seed=0):
+def make_vec_envs(num_envs=4):
     vec_env = make_vec_env(
         make_custom_env,
         n_envs=num_envs,
-        vec_env_cls= SubprocVecEnv
+        vec_env_cls=SubprocVecEnv
     )
-    
-    vec_env.reset(seed=seed)
-    
+    vec_env.reset()
     return vec_env
