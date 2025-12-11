@@ -220,7 +220,7 @@ class CustomEnvironment(gym.Wrapper):
 
         car = self.env.unwrapped.car
         speed = np.linalg.norm(car.hull.linearVelocity)
-        n_offroad_wheels = sum(1 for wheel in car.wheels if wheel.is_off_road)
+        n_offroad_wheels = sum(1 for wheel in car.wheels if len(wheel.tiles) == 0)
         
         if self.offroad_penalty:
             if n_offroad_wheels > 0:
@@ -252,8 +252,8 @@ class CustomEnvironment(gym.Wrapper):
                 angle_reward = np.exp(-(angle_diff_ratio**2) / (2 * (cfg.LINE_ANGLE_DECAY**2)))
                 angle_reward *= cfg.MAX_LINE_ANGLE_REWARD * speed_factor
                 reward += angle_reward
-            
         
+        return reward
     
     def reset(self, **kwargs):
         observation, info = self.env.reset(**kwargs)
