@@ -1,8 +1,6 @@
 import config as cfg
 import gymnasium as gym
-from gymnasium.envs.box2d.car_racing import CarRacing
-from gymnasium.envs.box2d.car_dynamics import Car
-import stable_baselines3 as sb3
+from gymnasium.envs.box2d.car_racing import CarRacing, TRACK_WIDTH
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
@@ -10,322 +8,436 @@ import numpy as np
 import cv2
 
 class CustomEnvironment(gym.Wrapper):
-    def __init__(self,
-        env,
-        gas_reward=cfg.GAS_REWARD,
-        wiggle_penalty=cfg.WIGGLE_PENALTY,
-        wiggle_tolerance=cfg.WIGGLE_TOLERANCE,
-        off_road_wheel_penalty=cfg.OFF_ROAD_WHEEL_PENALTY,
-        verbose=False
-    ):
+    def __init__(self, env, use_additional_rewards=True, offroad_penalty=False,
+                 line_distance_reward=False, line_angle_reward=False,
+                 drift_penalty=False, wiggle_penalty=False):
         super().__init__(env)
-        self.gas_reward = gas_reward
+        self.env = env
+        self.use_additional_rewards = use_additional_rewards
+        self.offroad_penalty = offroad_penalty
+        self.line_distance_reward = line_distance_reward
+        self.line_angle_reward = line_angle_reward
+        self.drift_penalty = drift_penalty
         self.wiggle_penalty = wiggle_penalty
-        self.wiggle_tolerance = wiggle_tolerance
-        self.off_road_wheel_penalty = off_road_wheel_penalty
-        self.verbose = verbose
         
-        # State tracking
-        self.last_action = np.array([0.0, 0.0, 0.0])
-        self.optimal_line = None # Will be set in reset()
-        
-        self.info = {}
-        self.info["wheels_on_road"] = 4
-        self.info["consecutive_off_road"] = 0
-
-        # --- CORREÇÃO IMPORTANTE ---
-        # Como vamos cortar a imagem, precisamos atualizar o observation_space
-        # O original é (96, 96, 3). Vamos remover 12 pixels de baixo, ficando (84, 96, 3).
+        if self.use_additional_rewards:
+            self.offroad_penalty = True
+            self.line_distance_reward = True
+            self.line_angle_reward = True
+            self.drift_penalty = True
+            self.wiggle_penalty = True
+            
+        # Cropped Observation Space (84x96)
         original_shape = self.env.observation_space.shape
         new_height = 84
+        
         self.observation_space = gym.spaces.Box(
             low=0, 
             high=255, 
-            shape=(new_height, original_shape[1], original_shape[2]), 
+            shape=(new_height, original_shape[1], 1), # (84, 96, 1)
             dtype=np.uint8
         )
-    
-    def reset(self, **kwargs):
-        # 1. Reset the simulation
-        obs, info = self.env.reset(**kwargs)
         
-        # 2. CRITICAL: Recalculate optimal line for the NEW track
-        self.optimal_line = self.get_optimal_path(iterations=200)
-        
-        # 3. Reset internal state
-        self.last_action = np.array([0.0, 0.0, 0.0])
-        self.info["consecutive_off_road"] = 0
-        
-        # 4. Aplica o corte na observação inicial
-        obs = self.remove_observation_hud(obs)
-            
-        return obs, info
-    
-    def check_early_stop(self, env):
-        car : Car = env.unwrapped.car
-        
-        wheels_on_road = 0
-        for wheel in car.wheels:
-            if len(wheel.tiles) > 0:
-                wheels_on_road += 1
-        
-        return wheels_on_road
-    
-    def get_optimal_path(self, iterations=100):
-        # 1. Extract the raw center line (x, y) coordinates
-        # env.track is a list of (alpha, beta, x, y)
+        self.consecutive_still_steps = 0
+        self.consecutive_offroad_steps = 0
+        self.optimal_line = None
+
+    def get_optimal_line(self, iterations=200):
         raw_track = self.env.unwrapped.track
         path = np.array([[p[2], p[3]] for p in raw_track])
+        
+        # Keep the line well within track boundaries
+        SAFE_MARGIN = 1.5  # More conservative margin
+        max_displacement = TRACK_WIDTH - SAFE_MARGIN
 
-        # 2. Track Parameters
-        # In CarRacing, track width is roughly constant. 
-        # We define a "Safe Width" slightly smaller than the real width so the agent doesn't clip the grass.
-        TRACK_WIDTH = 40.0 
-        SAFE_MARGIN = 6.0  # Stay away from the absolute edge
-        max_displacement = (TRACK_WIDTH / 2) - SAFE_MARGIN
-
-        # Copy the path to modify it
         optimized_path = np.copy(path)
         num_points = len(path)
 
-        # 3. The "Rubber Band" Iteration
-        for _ in range(iterations):
+        for iteration in range(iterations):
             for i in range(num_points):
-                # Get indices for previous and next points (handling the loop wrap-around)
                 prev_idx = (i - 1) % num_points
                 next_idx = (i + 1) % num_points
-
-                # A. Calculate the midpoint between neighbors
-                # The straightest line between Prev and Next passes through this midpoint
+                
+                # Smoothing: pull towards midpoint of neighbors
                 midpoint = (optimized_path[prev_idx] + optimized_path[next_idx]) / 2
+                # Use more aggressive smoothing in later iterations
+                blend_factor = 0.3 if iteration < iterations // 2 else 0.5
+                optimized_path[i] = optimized_path[i] * (1 - blend_factor) + midpoint * blend_factor
 
-                # B. Move the current point towards that midpoint (Smoothing)
-                # This creates the "Shortest Path" effect
-                # 0.5 means we move halfway there. 
-                optimized_path[i] = optimized_path[i] * 0.2 + midpoint * 0.8
-
-                # C. Constrain to Track Width (The "Walls")
-                # We cannot let the point leave the road.
-                # Calculate distance from the original center line (path[i])
+                # Constraint: enforce maximum distance from track center
                 center = path[i]
                 current = optimized_path[i]
-
                 diff = current - center
                 dist = np.linalg.norm(diff)
 
                 if dist > max_displacement:
-                    # If we pulled too tight and hit the wall, clamp it back to the edge
                     diff = diff / dist * max_displacement
                     optimized_path[i] = center + diff
 
         return optimized_path
-    
+
     def get_line_distance_and_angle_diff(self):
         """
-        Returns both the minimum distance to the optimal line and the angle difference
-        between car direction and the tangent of the closest segment.
+        Returns:
+        1. line_distance (float): Distance to closest point
+        2. angle_diff (float): Orientation error
+        3. closest_idx (int): The index of the closest point on the track
         """
+        if self.optimal_line is None:
+            return 0.0, 0.0, 0
+            
         car = self.env.unwrapped.car
         car_pos = np.array(car.hull.position, dtype=np.float32)
         
-        # 1. Define the segments
+        # 1. Define segments
         A = self.optimal_line
-        B = np.roll(self.optimal_line, -1, axis=0) # Shift entire array by -1 to get next points
+        B = np.roll(self.optimal_line, -1, axis=0) 
         
         # 2. Vectors
-        AB = B - A              # Vector of the road segment (tangent vectors)
-        AP = car_pos - A        # Vector from segment start to car
+        AB = B - A              
+        AP = car_pos - A        
         
-        # 3. Project AP onto AB to find "t"
+        # 3. Project AP onto AB
         dot_prod = np.sum(AP * AB, axis=1)
         ab_len_sq = np.sum(AB**2, axis=1)
         
         # Avoid division by zero
         t = np.divide(dot_prod, ab_len_sq, out=np.zeros_like(dot_prod), where=ab_len_sq!=0)
-        
-        # 4. Clamp t to segment bounds [0, 1]
         t = np.clip(t, 0.0, 1.0)
         
-        # 5. Calculate the closest point C on the segment
+        # 4. Closest point C on the segment
         C = A + (AB * t[:, np.newaxis])
         
-        # 6. Euclidean distance from Car P to Closest Point C
+        # 5. Distances
         diff = car_pos - C
         dists = np.linalg.norm(diff, axis=1)
         
-        # 7. Find the index of the closest segment
+        # 6. Find Closest Index
         closest_idx = np.argmin(dists)
         line_distance = dists[closest_idx]
         
-        # 8. Calculate angle difference between car velocity and tangent
+        # 7. Angle Calculation
         car_vel = car.hull.linearVelocity
         car_direction = np.array([car_vel.x, car_vel.y], dtype=np.float32)
         car_speed = np.linalg.norm(car_direction)
         
-        if car_speed < 0.1:
-            return line_distance, 0.0
+        angle_diff = 0.0
+        if car_speed > 0.1:
+            car_direction_norm = car_direction / car_speed
+            tangent = AB[closest_idx]
+            tangent_norm = tangent / np.linalg.norm(tangent)
+            dot_product = np.clip(np.dot(car_direction_norm, tangent_norm), -1.0, 1.0)
+            angle_diff = np.arccos(dot_product)
         
-        car_direction_norm = car_direction / car_speed
-        tangent = AB[closest_idx]
-        tangent_norm = tangent / np.linalg.norm(tangent)
-        
-        dot_product = np.clip(np.dot(car_direction_norm, tangent_norm), -1.0, 1.0)
-        angle_diff = np.arccos(dot_product)
-        
-        return line_distance, angle_diff
+        return line_distance, angle_diff, closest_idx
     
-    def line_distance_reward_function(self,
-        line_distance : float,
-        car_speed : float = 0.0,
-        max_reward = cfg.MAX_LINE_DISTANCE_REWARD,
-        dropoff =cfg.LINE_DISTANCE_REWARD_DROPOFF,
-        target_speed = cfg.TARGET_SPEED
-    ):
-        speed_factor = min(car_speed / target_speed, 1.0)
-        f = max_reward * np.exp(- (line_distance ** 2) / (2 * (dropoff ** 2))) * speed_factor
+    def get_lateral_velocity(self):
+        car = self.env.unwrapped.car
+        vel = car.hull.linearVelocity
+        speed = np.linalg.norm([vel.x, vel.y])
         
-        return f
-    
-    def line_angle_diff_reward_function(self,
-        angle_diff : float,
-        max_reward = cfg.MAX_ANGLE_DIFF_REWARD,
-        dropoff = cfg.ANGLE_DIFF_REWARD_DROPOFF,
-    ):
-        f = max_reward * np.exp(- (angle_diff ** 2) / (2 * (dropoff ** 2)))
-        return f
+        if speed < 0.1:
+            return np.array([0.0, 0.0])
+        
+        vel_norm = np.array([vel.x, vel.y]) / speed
+        
+        # Perpendicular vector to velocity
+        lateral_dir = np.array([-vel_norm[1], vel_norm[0]])
+        
+        lateral_velocity = np.dot(np.array([vel.x, vel.y]), lateral_dir) * lateral_dir
+        return lateral_velocity
     
     def remove_observation_hud(self, observation):
-        """
-        Removes the dashboard (HUD) from the bottom of the observation.
-        The CarRacing-v3 HUD is 12 pixels high.
-        Original: (96, 96, 3) -> Cropped: (84, 96, 3)
-        """
-        # Se for None (pode acontecer em resets quebrados), retorna None
-        if observation is None:
-            return None
-            
-        # Handle batched input (N_Envs, Height, Width, Channels)
-        if len(observation.shape) == 4:
-            return observation[:, :84, :, :]
-        # Handle single input (Height, Width, Channels)
-        elif len(observation.shape) == 3:
+        # Crop the bottom 12 pixels (HUD)
+        if len(observation.shape) == 3:
             return observation[:84, :, :]
         return observation
-    
+
+    def process_observation(self, observation):
+        # 1. Crop HUD
+        obs = self.remove_observation_hud(observation)
+        
+        # 2. Grayscale
+        # IMPORTANT: Do not use binary thresholding. 
+        # We need the gray shades to see the red/white curbs.
+        gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        
+        # 3. Add Channel Dimension for SB3 (H, W, 1)
+        return np.expand_dims(gray, axis=-1)
+
     def step(self, action):
         observation, reward, done, truncated, info = self.env.step(action)
         
-        if hasattr(info, "lap_finished"):
-            self.info["lap_finished"] = info["lap_finished"]
+        # Process Visuals
+        processed_obs = self.process_observation(observation)
+        
+        # --- CRITICAL FIX: Process Terminal Observation ---
+        # If the episode ends (truncated/done), SB3 looks at 'terminal_observation'.
+        # We must ensure this matches our observation space (84, 96, 1).
+        if "terminal_observation" in info:
+            info["terminal_observation"] = self.process_observation(info["terminal_observation"])
+        
+        # --- SIMPLIFIED REWARD SHAPING ---
+        # We trust the environment's native tile-based reward system.
+        
+        car = self.env.unwrapped.car
+        speed = np.linalg.norm(car.hull.linearVelocity)
 
-        # ----------------------------------------
-        #                GAS BIAS
-        # ----------------------------------------
-        gas = action[1]
-        reward += gas * self.gas_reward
-        
-        # ----------------------------------------
-        #            WIGGLE PROTECTION
-        # ----------------------------------------
-        current_steering = action[0]
-        last_steering = self.last_action[0]
-        wiggle = current_steering - last_steering
-        
-        if abs(wiggle) > self.wiggle_tolerance:
-            reward -= abs(wiggle) * self.wiggle_penalty
-        
-        self.last_action = action 
-        
-        line_distance, angle_diff = self.get_line_distance_and_angle_diff()
-        car_vel = self.env.unwrapped.car.hull.linearVelocity
-        car_speed = np.linalg.norm([car_vel.x, car_vel.y])
-        
-        # ======== PID REWARD COMPONENTS =========
-        reward += self.line_distance_reward_function(line_distance, car_speed)
-        reward += self.line_angle_diff_reward_function(angle_diff)
-        
-        # ----------------------------------------
-        #            EARLY STOP LOGIC
-        # ----------------------------------------
-        wheels_on_road = self.check_early_stop(self.env)
-        self.info["wheels_on_road"] = wheels_on_road
-        
-        if wheels_on_road == 0:
-            self.info["consecutive_off_road"] += 1
+        # 1. Wake up call: Penalty for not moving
+        if speed < cfg.STILL_SPEED_THRESHOLD:
+            reward -= cfg.STILL_PENALTY
+            self.consecutive_still_steps += 1
         else:
-            self.info["consecutive_off_road"] = 0
+            self.consecutive_still_steps = 0
         
-        if self.info["consecutive_off_road"] > cfg.MAX_OFF_ROAD_STEPS:
+        n_offroad_wheels = sum(1 for wheel in car.wheels if wheel.is_off_road)
+        if n_offroad_wheels >= 4:
+            self.consecutive_offroad_steps += 1
+        else:
+            self.consecutive_offroad_steps = 0
+        
+        
+        # 2. Timeout if stuck
+        if self.consecutive_still_steps > cfg.MAX_STILL_STEPS:
             truncated = True
-            reward -= 5.0
-        
-        # ----------------------------------------
-        #         OFF-ROAD WHEEL PENALTY
-        # ----------------------------------------
-        reward -= (4 - wheels_on_road) * self.off_road_wheel_penalty
-        
-        # Aplica o corte
-        clean_observation = self.remove_observation_hud(observation)
-        
-        return clean_observation, reward, done, truncated, self.info
+            reward -= cfg.TRUNCATION_PENALTY # Punishment for giving up
+            
+        # 3. Completion Bonus
+        if info.get("lap_finished"):
+             reward += cfg.LAP_FINISH_BONUS
 
-if __name__ == "__main__":
-    print("Initializing CarRacing-v3...")
-    
-    # render_mode='rgb_array' ainda é necessário para o backend funcionar, 
-    # mas não usaremos o 'render()' para visualização direta
-    env = gym.make("CarRacing-v3", render_mode="rgb_array")
-    
-    # Wrap it
-    env = CustomEnvironment(env)
-    
-    obs, _ = env.reset()
-    print(f"Environment reset. Observation shape: {obs.shape}") # Deve ser (84, 96, 3)
-    
-    try:
-        while True:
-            # Action: [Steering, Gas, Brake]
-            action = np.array([0.0, 0.2, 0.0])
+        reward = self.apply_additional_rewards(reward)
+        
+        return processed_obs, reward, done, truncated, info
+
+    def apply_additional_rewards(self, reward):   
+        if not self.use_additional_rewards:
+            return reward
+
+        car = self.env.unwrapped.car
+        speed = np.linalg.norm(car.hull.linearVelocity)
+        n_offroad_wheels = sum(1 for wheel in car.wheels if wheel.is_off_road)
+        
+        if self.offroad_penalty:
+            if n_offroad_wheels > 0:
+                reward -= n_offroad_wheels * cfg.OFFROAD_WHEEL_PENALTY
+        
+        if self.drift_penalty:
+            lateral_velocity = self.get_lateral_velocity()
+            drift_amount = np.linalg.norm(lateral_velocity)
+            if drift_amount > cfg.DRIFT_THRESHOLD:
+                reward -= cfg.DRIFT_PENALTY * (drift_amount / (speed + 1e-5))
+        
+        if self.line_distance_reward or self.line_angle_reward:
+            line_distance, angle_diff, _ = self.get_line_distance_and_angle_diff()
+            angle_diff_ratio = abs(angle_diff / np.pi)  # Normalize to [0, 1]
+            speed_factor = min(speed / cfg.TARGET_SPEED, 1.0)
             
-            # Step the environment
-            obs, reward, terminated, truncated, info = env.step(action)
-            
-            # --- VISUALIZAÇÃO DO AGENTE (CORTADA) ---
-            # 'obs' é o que o agente vê. O Gym retorna RGB, mas o OpenCV usa BGR.
-            # Precisamos converter para as cores ficarem certas na janela.
-            frame_agent = cv2.cvtColor(obs, cv2.COLOR_RGB2BGR)
-            
-            # Upscale the image for better visualization
-            frame_agent_upscaled = cv2.resize(frame_agent, (480, 420), interpolation=cv2.INTER_NEAREST)
-            
-            cv2.imshow("Agent View (Cropped)", frame_agent_upscaled)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            
-            # Reset if episode ends
-            if terminated or truncated:
-                print("Episode finished. Resetting...")
-                obs, _ = env.reset()
+            if self.line_distance_reward:
+                distance_reward = np.exp(-(line_distance**2) / (2 * (cfg.LINE_DISTANCE_DECAY**2)))
+                distance_reward *= cfg.MAX_LINE_DISTANCE_REWARD * speed_factor
+                reward += distance_reward
                 
-    except KeyboardInterrupt:
-        print("\nStopping...")
-    finally:
-        env.close()
-        cv2.destroyAllWindows()
+            if self.line_angle_reward:
+                angle_reward = np.exp(-(angle_diff_ratio**2) / (2 * (cfg.LINE_ANGLE_DECAY**2)))
+                angle_reward *= cfg.MAX_LINE_ANGLE_REWARD * speed_factor
+                reward += angle_reward
+            
         
-def make_custom_env(render_mode="rgb_array"):
-    env = gym.make("CarRacing-v3", render_mode=render_mode)
-    custom_env = CustomEnvironment(env)
-    custom_env = Monitor(custom_env)
-    custom_env.reset()
-    return custom_env
+    
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        self.consecutive_still_steps = 0
+        self.consecutive_offroad_steps = 0
+        self.optimal_line = self.get_optimal_line()
+        return self.process_observation(observation), info
 
-def make_vec_envs(num_envs=4):
-    vec_env = make_vec_env(
-        make_custom_env,
+class CustomRepeatWrapper(gym.Wrapper):
+    def __init__(self, env, repeat=cfg.ACTION_REPEAT):
+        super().__init__(env)
+        self.repeat = repeat
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        total_reward = 0.0
+        done = False
+        truncated = False
+        info = {}
+        
+        for _ in range(self.repeat):
+            obs, rew, terminated, truncated_step, info = self.env.step(action)
+            total_reward += rew
+            if terminated or truncated_step:
+                done = terminated
+                truncated = truncated_step
+                break
+        
+        return obs, total_reward, done, truncated, info
+
+def make_custom_env(render_mode="rgb_array", use_custom_rewards=True):
+    env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=True)
+    custom_env = CustomEnvironment(env, use_custom_rewards=use_custom_rewards)
+    custom_env_repeat = CustomRepeatWrapper(custom_env)
+    return Monitor(custom_env_repeat)
+
+def make_vec_envs(num_envs=cfg.NUM_ENVS_LOW, use_custom_rewards=True):
+    return make_vec_env(
+        lambda: make_custom_env(use_custom_rewards=use_custom_rewards),
         n_envs=num_envs,
         vec_env_cls=SubprocVecEnv
     )
-    vec_env.reset()
-    return vec_env
+    
+    
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon
+    from matplotlib.collections import PatchCollection
+    
+    while True:
+        # Create environment and generate track
+        env = gym.make("CarRacing-v3", render_mode="rgb_array")
+        custom_env = CustomEnvironment(env)
+        custom_env.reset()
+        
+        # Get track and optimal line
+        raw_track = custom_env.env.unwrapped.track
+        track_path = np.array([[p[2], p[3]] for p in raw_track])
+        optimal_line = custom_env.optimal_line
+        
+        # Get actual track width from environment constants
+        from gymnasium.envs.box2d.car_racing import TRACK_WIDTH, SCALE
+        track_width = TRACK_WIDTH
+        
+        # Create track edges (left and right boundaries)
+        track_left = []
+        track_right = []
+        
+        for i in range(len(raw_track)):
+            alpha, beta, x, y = raw_track[i]
+            # Calculate perpendicular direction
+            left_x = x - track_width * np.cos(beta)
+            left_y = y - track_width * np.sin(beta)
+            right_x = x + track_width * np.cos(beta)
+            right_y = y + track_width * np.sin(beta)
+            
+            track_left.append([left_x, left_y])
+            track_right.append([right_x, right_y])
+        
+        track_left = np.array(track_left)
+        track_right = np.array(track_right)
+        
+        # Visualize
+        fig, ax = plt.subplots(figsize=(12, 12))
+        
+        # Plot track boundaries
+        ax.plot(track_left[:, 0], track_left[:, 1], 'k-', linewidth=1.5, alpha=0.7, label='Track Boundaries')
+        ax.plot(track_right[:, 0], track_right[:, 1], 'k-', linewidth=1.5, alpha=0.7)
+        
+        # Fill track area
+        # Create polygons for track segments
+        for i in range(len(track_left)):
+            i_next = (i + 1) % len(track_left)
+            vertices = [
+                track_left[i],
+                track_right[i],
+                track_right[i_next],
+                track_left[i_next]
+            ]
+            poly = Polygon(vertices, facecolor='gray', edgecolor='none', alpha=0.3)
+            ax.add_patch(poly)
+        
+        # Plot centerline and optimal line
+        ax.plot(track_path[:, 0], track_path[:, 1], 'b--', linewidth=1.5, alpha=0.6, label='Track Center')
+        ax.plot(optimal_line[:, 0], optimal_line[:, 1], 'r-', linewidth=2.5, label='Optimal Racing Line')
+        
+        # Mark start position
+        ax.scatter(track_path[0, 0], track_path[0, 1], c='green', s=150, marker='o', 
+                  label='Start', zorder=5, edgecolors='darkgreen', linewidth=2)
+        
+        # === DEMONSTRATION: Random point analysis using class methods ===
+        # Choose a random point within the track bounds
+        random_track_idx = np.random.randint(0, len(track_path))
+        track_center = track_path[random_track_idx]
+        # Offset from center (simulate a car position)
+        random_offset = (np.random.rand(2) - 0.5) * track_width * 1.5
+        random_point = track_center + random_offset
+        
+        # Create a random velocity vector at the point
+        random_angle = np.random.uniform(0, 2 * np.pi)
+        random_velocity = np.array([np.cos(random_angle), np.sin(random_angle)]) * 20
+        
+        # Temporarily set car position and velocity to use the class method
+        car = custom_env.env.unwrapped.car
+        original_pos = car.hull.position.copy()
+        original_vel = car.hull.linearVelocity.copy()
+        
+        # Set random position and velocity
+        car.hull.position = (float(random_point[0]), float(random_point[1]))
+        car.hull.linearVelocity = (float(random_velocity[0]), float(random_velocity[1]))
+        
+        # Use the class method to calculate everything
+        line_distance, angle_diff_rad, closest_idx = custom_env.get_line_distance_and_angle_diff()
+        angle_diff_deg = np.degrees(angle_diff_rad)
+        
+        # Calculate closest point and tangent for visualization
+        A = optimal_line
+        B = np.roll(optimal_line, -1, axis=0)
+        AB = B - A
+        AP = random_point - A
+        
+        dot_prod = np.sum(AP * AB, axis=1)
+        ab_len_sq = np.sum(AB**2, axis=1)
+        t = np.divide(dot_prod, ab_len_sq, out=np.zeros_like(dot_prod), where=ab_len_sq!=0)
+        t = np.clip(t, 0.0, 1.0)
+        
+        C = A + (AB * t[:, np.newaxis])
+        closest_point = C[closest_idx]
+        
+        tangent = AB[closest_idx]
+        tangent_normalized = tangent / np.linalg.norm(tangent)
+        
+        # Restore original car state
+        car.hull.position = original_pos
+        car.hull.linearVelocity = original_vel
+        
+        # Plot the demonstration
+        # Random point
+        ax.scatter(random_point[0], random_point[1], c='purple', s=200, marker='*', 
+                  label='Random Point', zorder=10, edgecolors='black', linewidth=2)
+        
+        # Distance line to closest point on optimal line
+        ax.plot([random_point[0], closest_point[0]], [random_point[1], closest_point[1]], 
+               'purple', linewidth=2, linestyle=':', alpha=0.8, label=f'Distance: {line_distance:.2f}')
+        ax.scatter(closest_point[0], closest_point[1], c='orange', s=100, marker='x', 
+                  zorder=10, linewidth=3)
+        
+        # Random velocity vector
+        ax.arrow(random_point[0], random_point[1], random_velocity[0], random_velocity[1],
+                head_width=3, head_length=2, fc='blue', ec='blue', linewidth=2, 
+                alpha=0.7, label='Random Velocity', zorder=9)
+        
+        # Tangent vector at closest point
+        tangent_scale = 25
+        ax.arrow(closest_point[0], closest_point[1], 
+                tangent_normalized[0] * tangent_scale, tangent_normalized[1] * tangent_scale,
+                head_width=3, head_length=2, fc='cyan', ec='cyan', linewidth=2, 
+                alpha=0.7, label='Line Tangent', zorder=9)
+        
+        # Add angle annotation
+        ax.text(random_point[0] + 5, random_point[1] + 5, 
+               f'Angle Diff: {angle_diff_deg:.1f}°', 
+               fontsize=11, bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
+        
+        ax.axis('equal')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right', fontsize=9)
+        ax.set_title(f'CarRacing Track (Width: {track_width*2:.1f}) with Optimal Racing Line', fontsize=14)
+        ax.set_xlabel('X Position', fontsize=12)
+        ax.set_ylabel('Y Position', fontsize=12)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        env.close()
