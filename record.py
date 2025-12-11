@@ -16,7 +16,7 @@ os.makedirs(video_subfolder, exist_ok=True)
 print(f"Videos will be saved to: {video_subfolder}")
 
 # Load the best model
-best_model_path = r"C:\car-racing-v2\models\best_model\best_model.zip"
+best_model_path = r"C:\car-racing-with-reinforcement-learning\models\best_model\best_model.zip"
 print(f"Loading model from: {best_model_path}")
 model = PPO.load(best_model_path)
 
