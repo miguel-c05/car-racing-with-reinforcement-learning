@@ -36,8 +36,8 @@ LINE_ANGLE_DECAY = 0.333       # Disabled
 DRIFT_PENALTY = 0.02               # Disabled
 DRIFT_THRESHOLD = 0.0             # Disabled
 
-WIGGLE_PENALTY = 0.07             # Disabled
-WIGGLE_THRESHOLD = 0.0           # Disabled
+WIGGLE_PENALTY = 0.05             # Disabled
+WIGGLE_THRESHOLD = 0.3           # Disabled
 
 TARGET_SPEED = 50.0               # Disabled
 

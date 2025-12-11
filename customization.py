@@ -40,6 +40,7 @@ class CustomEnvironment(gym.Wrapper):
         
         self.consecutive_still_steps = 0
         self.consecutive_offroad_steps = 0
+        self.last_action = None
         self.optimal_line = None
 
     def get_optimal_line(self, iterations=200):
@@ -206,11 +207,13 @@ class CustomEnvironment(gym.Wrapper):
         if info.get("lap_finished"):
              reward += cfg.LAP_FINISH_BONUS
 
-        reward = self.apply_additional_rewards(reward)
+        reward = self.apply_additional_rewards(action, reward)
+        
+        self.last_action = action.copy()
         
         return processed_obs, reward, done, truncated, info
 
-    def apply_additional_rewards(self, reward):   
+    def apply_additional_rewards(self, action, reward):   
         if not self.use_additional_rewards:
             return reward
 
@@ -227,6 +230,12 @@ class CustomEnvironment(gym.Wrapper):
             drift_amount = np.linalg.norm(lateral_velocity)
             if drift_amount > cfg.DRIFT_THRESHOLD:
                 reward -= cfg.DRIFT_PENALTY * (drift_amount / (speed + 1e-5))
+                
+        if self.wiggle_penalty:
+            steering = action[0]
+            wiggle = abs(steering - self.last_action[0]) if self.last_action is not None else 0.0
+            if wiggle > cfg.WIGGLE_THRESHOLD:
+                reward -= cfg.WIGGLE_PENALTY * steering
         
         if self.line_distance_reward or self.line_angle_reward:
             line_distance, angle_diff, _ = self.get_line_distance_and_angle_diff()
@@ -249,6 +258,7 @@ class CustomEnvironment(gym.Wrapper):
         observation, info = self.env.reset(**kwargs)
         self.consecutive_still_steps = 0
         self.consecutive_offroad_steps = 0
+        self.last_action = None
         self.optimal_line = self.get_optimal_line()
         return self.process_observation(observation), info
 
