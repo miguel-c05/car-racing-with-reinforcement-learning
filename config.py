@@ -21,25 +21,25 @@ STILL_SPEED_THRESHOLD = 1.0 # Speed below which the car is considered "still"
 MAX_STILL_STEPS = 100       # Max steps allowed without moving before truncation
 LAP_FINISH_BONUS = 100.0    # Extra bonus if it actually completes a lap (rare early on)
 # -------------------------------------------
-MAX_OFFROAD_STEPS = 400      # Disabled
+MAX_OFFROAD_STEPS = 400      
 
-TRUNCATION_PENALTY = 5.0          # Disabled
+TRUNCATION_PENALTY = 5.0          
 
-OFFROAD_WHEEL_PENALTY = 0.025        # Disabled
+OFFROAD_WHEEL_PENALTY = 0.025        
 
-MAX_LINE_DISTANCE_REWARD = 0.25  # Disabled
-LINE_DISTANCE_DECAY = 7.0        # Disabled
+MAX_LINE_DISTANCE_REWARD = 0.25  
+LINE_DISTANCE_DECAY = 7.0        
 
-MAX_LINE_ANGLE_REWARD = 0.0     # Disabled
-LINE_ANGLE_DECAY = 0.333       # Disabled
+MAX_LINE_ANGLE_REWARD = 0.03     
+LINE_ANGLE_DECAY = 0.333       
 
-DRIFT_PENALTY = 0.02               # Disabled
-DRIFT_THRESHOLD = 0.0             # Disabled
+DRIFT_PENALTY = 0.02               
+DRIFT_THRESHOLD = 0.0             
 
-WIGGLE_PENALTY = 0.05             # Disabled
-WIGGLE_THRESHOLD = 0.3           # Disabled
+WIGGLE_PENALTY = 0.05             
+WIGGLE_THRESHOLD = 0.3           
 
-TARGET_SPEED = 50.0               # Disabled
+TARGET_SPEED = 50.0               
 
 # --- TRAINING DURATION ---
 
