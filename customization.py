@@ -191,7 +191,8 @@ class CustomEnvironment(gym.Wrapper):
         else:
             self.consecutive_still_steps = 0
         
-        n_offroad_wheels = sum(1 for wheel in car.wheels if wheel.is_off_road)
+        # Count wheels off road (a wheel is off-road if it has no tiles beneath it)
+        n_offroad_wheels = sum(1 for wheel in car.wheels if len(wheel.tiles) == 0)
         if n_offroad_wheels >= 4:
             self.consecutive_offroad_steps += 1
         else:
@@ -286,15 +287,15 @@ class CustomRepeatWrapper(gym.Wrapper):
         
         return obs, total_reward, done, truncated, info
 
-def make_custom_env(render_mode="rgb_array", use_custom_rewards=True):
+def make_custom_env(render_mode="rgb_array", use_additional_rewards=True):
     env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=True)
-    custom_env = CustomEnvironment(env, use_custom_rewards=use_custom_rewards)
+    custom_env = CustomEnvironment(env, use_additional_rewards=use_additional_rewards)
     custom_env_repeat = CustomRepeatWrapper(custom_env)
     return Monitor(custom_env_repeat)
 
-def make_vec_envs(num_envs=cfg.NUM_ENVS_LOW, use_custom_rewards=True):
+def make_vec_envs(num_envs=cfg.NUM_ENVS_LOW, use_additional_rewards=True):
     return make_vec_env(
-        lambda: make_custom_env(use_custom_rewards=use_custom_rewards),
+        lambda: make_custom_env(use_additional_rewards=use_additional_rewards),
         n_envs=num_envs,
         vec_env_cls=SubprocVecEnv
     )
