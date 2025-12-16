@@ -5,7 +5,7 @@ from stable_baselines3.common.vec_env import VecFrameStack
 import config as cfg
 
 def main():
-    cfg.TOTAL_TIMESTEPS = 4_000_000  # 8 million timesteps for final training
+    cfg.TOTAL_TIMESTEPS = cfg.TOTAL_TIMESTEPS  # 2 million timesteps for final training
     cfg.SAVE_FREQ = 500
     # 1. Setup
     print(f"Configuration:")

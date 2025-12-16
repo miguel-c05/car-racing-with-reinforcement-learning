@@ -7,7 +7,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecFrameStack, VecTransposeImage
 from gymnasium.wrappers import RecordVideo
 
-TOTAL_TIMESTEPS = 250_000  # Ensure this matches your training config
+TOTAL_TIMESTEPS = 9_000_000  # Ensure this matches your training config
 
 # Create video directory based on training timesteps
 video_subfolder = f"videos/{TOTAL_TIMESTEPS}"
@@ -16,7 +16,7 @@ os.makedirs(video_subfolder, exist_ok=True)
 print(f"Videos will be saved to: {video_subfolder}")
 
 # Load the best model
-best_model_path = r"C:\car-racing-with-reinforcement-learning\models\best_model\best_model.zip"
+best_model_path = r"C:\car-racing-with-reinforcement-learning\models\phased\phase_3_mastery\best_model\best_model.zip"
 print(f"Loading model from: {best_model_path}")
 model = PPO.load(best_model_path)
 

@@ -83,9 +83,10 @@ class CustomEnvironment(gym.Wrapper):
         1. line_distance (float): Distance to closest point
         2. angle_diff (float): Orientation error
         3. closest_idx (int): The index of the closest point on the track
+        4. is_backwards (bool): True if the car is going backwards along the track
         """
         if self.optimal_line is None:
-            return 0.0, 0.0, 0
+            return 0.0, 0.0, 0, False
             
         car = self.env.unwrapped.car
         car_pos = np.array(car.hull.position, dtype=np.float32)
@@ -117,20 +118,31 @@ class CustomEnvironment(gym.Wrapper):
         closest_idx = np.argmin(dists)
         line_distance = dists[closest_idx]
         
-        # 7. Angle Calculation
+        # 7. Angle Calculation and Direction Check
         car_vel = car.hull.linearVelocity
         car_direction = np.array([car_vel.x, car_vel.y], dtype=np.float32)
         car_speed = np.linalg.norm(car_direction)
         
         angle_diff = 0.0
+        is_backwards = False
+        
         if car_speed > 0.1:
             car_direction_norm = car_direction / car_speed
             tangent = AB[closest_idx]
             tangent_norm = tangent / np.linalg.norm(tangent)
-            dot_product = np.clip(np.dot(car_direction_norm, tangent_norm), -1.0, 1.0)
-            angle_diff = np.arccos(dot_product)
+            
+            # Dot product tells us if we're going forward or backward
+            # Positive = same direction, Negative = opposite direction
+            direction_dot = np.dot(car_direction_norm, tangent_norm)
+            
+            # If dot product is negative, car is going backwards
+            is_backwards = direction_dot < 0
+            
+            # Calculate angle difference (always positive)
+            dot_product = np.clip(direction_dot, -1.0, 1.0)
+            angle_diff = np.arccos(abs(dot_product))
         
-        return line_distance, angle_diff, closest_idx
+        return line_distance, angle_diff, closest_idx, is_backwards
     
     def get_lateral_velocity(self):
         car = self.env.unwrapped.car
@@ -198,7 +210,6 @@ class CustomEnvironment(gym.Wrapper):
         else:
             self.consecutive_offroad_steps = 0
         
-        
         # 2. Timeout if stuck
         if self.consecutive_still_steps > cfg.MAX_STILL_STEPS:
             truncated = True
@@ -239,19 +250,37 @@ class CustomEnvironment(gym.Wrapper):
                 reward -= cfg.WIGGLE_PENALTY * steering
         
         if self.line_distance_reward or self.line_angle_reward:
-            line_distance, angle_diff, _ = self.get_line_distance_and_angle_diff()
-            angle_diff_ratio = abs(angle_diff / np.pi)  # Normalize to [0, 1]
-            speed_factor = min(speed / cfg.TARGET_SPEED, 1.0)
+            line_distance, angle_diff, closest_idx, is_backwards = self.get_line_distance_and_angle_diff()
             
-            if self.line_distance_reward:
-                distance_reward = np.exp(-(line_distance**2) / (2 * (cfg.LINE_DISTANCE_DECAY**2)))
-                distance_reward *= cfg.MAX_LINE_DISTANCE_REWARD * speed_factor
-                reward += distance_reward
+            # CRITICAL: Heavy penalty for going backwards
+            # This prevents the agent from exploiting the tile reward by going backwards
+            if is_backwards:
+                # Scale penalty with speed - faster backwards = worse penalty
+                backwards_penalty = cfg.MAX_LINE_DISTANCE_REWARD + (cfg.MAX_LINE_ANGLE_REWARD * 2.0)
+                reward -= backwards_penalty * min(speed / cfg.TARGET_SPEED, 1.5)
+            else:
+                # Only give rewards if going in the correct direction
+                angle_diff_ratio = abs(angle_diff / np.pi)  # Normalize to [0, 1]
+                speed_factor = min(speed / cfg.TARGET_SPEED, 1.0)
                 
-            if self.line_angle_reward:
-                angle_reward = np.exp(-(angle_diff_ratio**2) / (2 * (cfg.LINE_ANGLE_DECAY**2)))
-                angle_reward *= cfg.MAX_LINE_ANGLE_REWARD * speed_factor
-                reward += angle_reward
+                if self.line_distance_reward:
+                    if line_distance < cfg.LINE_SAFE_DISTANCE:
+                        # Max reward when within safe distance
+                        distance_reward = cfg.MAX_LINE_DISTANCE_REWARD * speed_factor
+                    else:
+                        # Gaussian decay beyond safe distance
+                        distance_reward = np.exp(-(line_distance**2) / (2 * (cfg.LINE_DISTANCE_DECAY**2)))
+                        distance_reward *= cfg.MAX_LINE_DISTANCE_REWARD * speed_factor
+                    reward += distance_reward
+                    
+                if self.line_angle_reward:
+                    if angle_diff < np.radians(cfg.LINE_SAFE_ANGLE):
+                        # Max reward when within safe angle
+                        angle_reward = cfg.MAX_LINE_ANGLE_REWARD * speed_factor
+                    else:
+                        angle_reward = np.exp(-(angle_diff_ratio**2) / (2 * (cfg.LINE_ANGLE_DECAY**2)))
+                        angle_reward *= cfg.MAX_LINE_ANGLE_REWARD * speed_factor
+                    reward += angle_reward
         
         return reward
     
@@ -389,7 +418,7 @@ if __name__ == "__main__":
         car.hull.linearVelocity = (float(random_velocity[0]), float(random_velocity[1]))
         
         # Use the class method to calculate everything
-        line_distance, angle_diff_rad, closest_idx = custom_env.get_line_distance_and_angle_diff()
+        line_distance, angle_diff_rad, closest_idx, is_backwards = custom_env.get_line_distance_and_angle_diff()
         angle_diff_deg = np.degrees(angle_diff_rad)
         
         # Calculate closest point and tangent for visualization

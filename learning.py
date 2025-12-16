@@ -41,7 +41,8 @@ class EnhancedProgressBarCallback(BaseCallback):
 class Driver:
     def __init__(self, vec_env, eval_env=None, algorithm="PPO", training_steps=cfg.DEBUGGING_TIMESTEPS, save_freq=cfg.SAVE_FREQ, 
                  checkpoint_dir=cfg.CHECKPOINT_DIR, log_dir=cfg.LOG_DIR, 
-                 best_model_dir=cfg.BEST_MODEL_DIR, eval_freq=cfg.EVAL_FREQ, n_eval_episodes=cfg.N_EVAL_EPISODES):
+                 best_model_dir=cfg.BEST_MODEL_DIR, eval_freq=cfg.EVAL_FREQ, n_eval_episodes=cfg.N_EVAL_EPISODES,
+                 custom_ppo_params=None):
         
         self.vec_env = vec_env
         self.eval_env = eval_env
@@ -93,7 +94,12 @@ class Driver:
         
         # --- MODEL SETUP ---
         if self.algorithm == "ppo":
-            self.model_params = cfg.PPO_PARAMS
+            # Start with default params, then override with custom ones if provided
+            self.model_params = cfg.PPO_PARAMS.copy()
+            if custom_ppo_params:
+                # Merge custom params (phase-specific) with defaults
+                self.model_params.update(custom_ppo_params)
+            
             self.model_params["env"] = self.vec_env
             self.model_params["tensorboard_log"] = self.log_dir
             self.model = PPO(**self.model_params)
