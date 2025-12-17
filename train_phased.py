@@ -1,3 +1,20 @@
+"""Curriculum learning script with multi-phase training.
+
+Executes sequential training phases with different hyperparameters and reward
+weights. Each phase loads the best model from the previous phase and continues
+training with new configuration.
+
+Usage:
+    ```bash
+    python train_phased.py
+    ```
+
+Phases are defined in config.TRAINING_PHASES with phase-specific:
+    - PPO hyperparameters (learning_rate, ent_coef, etc.)
+    - Reward weights (line following, penalties, etc.)
+    - Timesteps per phase
+"""
+
 import gymnasium as gym
 from customization import make_vec_envs
 from learning import Driver
@@ -7,15 +24,18 @@ import config as cfg
 import os
 
 def train_phase(phase_idx, previous_model_path=None):
-    """
-    Train a single phase of the phased training curriculum.
+    """Train a single phase of the curriculum with phase-specific config.
+    
+    Loads previous model weights (if provided), applies phase configuration,
+    and trains with custom PPO hyperparameters and reward weights.
     
     Args:
-        phase_idx (int): Index of the phase to train (0-based)
-        previous_model_path (str, optional): Path to model from previous phase
+        phase_idx (int): Phase index (0-based) from cfg.TRAINING_PHASES.
+        previous_model_path (str, optional): Path to best model from previous phase.
+            If provided, transfers policy and value network weights.
         
     Returns:
-        str: Path to the best model from this phase
+        str: Path to best_model.zip from this phase.
     """
     # Get phase configuration
     phase_config = cfg.get_phase_config(phase_idx)
@@ -95,10 +115,14 @@ def train_phase(phase_idx, previous_model_path=None):
     return best_model_path
 
 def main():
-    """
-    Run full phased training curriculum.
-    Each phase trains with different hyperparameters and reward weights,
-    continuing from the previous phase's best model.
+    """Execute full curriculum learning workflow.
+    
+    Displays phase overview, prompts user to start, then trains each phase
+    sequentially. Each phase continues from the previous phase's best model
+    with new hyperparameters and reward configurations.
+    
+    Output:
+        Checkpoints and best models saved per phase in ./models/phased/{phase_name}/
     """
     print(f"\n{'#'*60}")
     print(f"# PHASED TRAINING CURRICULUM")

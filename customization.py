@@ -8,10 +8,50 @@ import numpy as np
 import cv2
 
 class CustomEnvironment(gym.Wrapper):
+    """A custom wrapper for the CarRacing environment that implements reward shaping,
+    observation preprocessing, and optimal racing line calculation.
+
+    This wrapper enhances the standard CarRacing-v3 environment by:
+    1. Preprocessing observations: Cropping the HUD and converting to grayscale.
+    2. Calculating an optimal racing line using Laplacian smoothing.
+    3. Providing auxiliary rewards based on:
+        - Distance to the optimal racing line.
+        - Alignment angle with the optimal racing line.
+        - Penalties for off-road driving, drifting, and erratic steering.
+
+    Attributes:
+        env (gym.Env): The wrapped Gymnasium environment.
+        use_additional_rewards (bool): Whether to apply custom reward shaping.
+        offroad_penalty (bool): Enable penalty for wheels going off-track.
+        line_distance_reward (bool): Enable reward for staying close to the optimal line.
+        line_angle_reward (bool): Enable reward for aligning with the optimal line.
+        drift_penalty (bool): Enable penalty for excessive lateral velocity.
+        wiggle_penalty (bool): Enable penalty for rapid steering changes.
+        fast_steering_penalty (bool): Enable penalty for sharp steering at high speeds.
+        cap_bell_curves (bool): (Deprecated) Legacy flag for reward calculation.
+        observation_space (gym.spaces.Box): The modified observation space (84, 96, 1).
+        consecutive_still_steps (int): Counter for steps with low speed.
+        consecutive_offroad_steps (int): Counter for steps with all wheels off-road.
+        last_action (np.ndarray): The action taken in the previous step.
+        optimal_line (np.ndarray): The calculated optimal racing line coordinates.
+    """
     def __init__(self, env, use_additional_rewards=True, offroad_penalty=False,
                  line_distance_reward=False, line_angle_reward=False,
                  drift_penalty=False, wiggle_penalty=False, fast_steering_penalty=False,
                  cap_bell_curves=False):
+        """Initialize the CustomEnvironment wrapper.
+
+        Args:
+            env (gym.Env): The environment to wrap.
+            use_additional_rewards (bool, optional): Master switch for custom rewards. Defaults to True.
+            offroad_penalty (bool, optional): Enable off-road penalty. Defaults to False.
+            line_distance_reward (bool, optional): Enable line distance reward. Defaults to False.
+            line_angle_reward (bool, optional): Enable line angle reward. Defaults to False.
+            drift_penalty (bool, optional): Enable drift penalty. Defaults to False.
+            wiggle_penalty (bool, optional): Enable wiggle penalty. Defaults to False.
+            fast_steering_penalty (bool, optional): Enable fast steering penalty. Defaults to False.
+            cap_bell_curves (bool, optional): Legacy parameter. Defaults to False.
+        """
         super().__init__(env)
         self.env = env
         self.use_additional_rewards = use_additional_rewards
@@ -49,6 +89,20 @@ class CustomEnvironment(gym.Wrapper):
         self.optimal_line = None
 
     def get_optimal_line(self, iterations=200):
+        """Calculates an optimal racing line using Laplacian smoothing on track center points.
+
+        The algorithm iteratively smooths the track path while constraining points to stay
+        within the track boundaries. This creates a "racing line" that cuts corners and
+        optimizes the path through the track.
+
+        Args:
+            iterations (int, optional): Number of smoothing iterations. Higher values produce
+                smoother lines but may be computationally expensive. Defaults to 200.
+
+        Returns:
+            np.ndarray: An array of shape (N, 2) containing the (x, y) coordinates of the
+                optimal racing line, where N is the number of track points.
+        """
         raw_track = self.env.unwrapped.track
         path = np.array([[p[2], p[3]] for p in raw_track])
         
@@ -150,6 +204,15 @@ class CustomEnvironment(gym.Wrapper):
         return line_distance, angle_diff, closest_idx, is_backwards
     
     def get_lateral_velocity(self):
+        """Calculates the lateral (sideways) component of the car's velocity.
+
+        This is used to detect drifting behavior. The method projects the car's velocity
+        vector onto the vector perpendicular to the car's heading direction.
+
+        Returns:
+            np.ndarray: A 2D vector representing the lateral velocity in world coordinates.
+                Returns [0.0, 0.0] if the car's speed is below 0.1 to avoid numerical issues.
+        """
         car = self.env.unwrapped.car
         vel = car.hull.linearVelocity
         speed = np.linalg.norm([vel.x, vel.y])
@@ -166,12 +229,41 @@ class CustomEnvironment(gym.Wrapper):
         return lateral_velocity
     
     def remove_observation_hud(self, observation):
+        """Crops the bottom HUD (Heads-Up Display) from the observation.
+
+        The CarRacing environment includes a status bar at the bottom of the screen
+        which displays speed and other metrics. This information is irrelevant for
+        the agent's learning and can be distracting.
+
+        Args:
+            observation (np.ndarray): The raw RGB observation from the environment.
+
+        Returns:
+            np.ndarray: The cropped observation with the bottom 12 pixels removed.
+        """
         # Crop the bottom 12 pixels (HUD)
         if len(observation.shape) == 3:
             return observation[:84, :, :]
         return observation
 
     def process_observation(self, observation):
+        """Full observation processing pipeline: Crop HUD -> Grayscale -> Add Channel Dim.
+
+        Converts the raw RGB observation into the format expected by the CNN policy.
+        The pipeline consists of:
+        1. Cropping the HUD from the bottom of the frame.
+        2. Converting RGB to grayscale to reduce dimensionality.
+        3. Adding a channel dimension for compatibility with Stable-Baselines3.
+
+        Grayscale is used instead of RGB to reduce computational cost while preserving
+        important visual features like road boundaries and curbs.
+
+        Args:
+            observation (np.ndarray): The raw observation from the environment with shape (96, 96, 3).
+
+        Returns:
+            np.ndarray: The processed observation with shape (84, 96, 1).
+        """
         # 1. Crop HUD
         obs = self.remove_observation_hud(observation)
         
@@ -184,6 +276,27 @@ class CustomEnvironment(gym.Wrapper):
         return np.expand_dims(gray, axis=-1)
 
     def step(self, action):
+        """Executes one step in the environment with custom processing.
+
+        This method:
+        1. Executes the action in the wrapped environment.
+        2. Processes the observation (crop HUD, convert to grayscale).
+        3. Updates internal counters (still steps, offroad steps).
+        4. Checks for early stopping conditions (stuck, too much offroad time).
+        5. Applies custom reward shaping if enabled.
+
+        Args:
+            action (np.ndarray): The action to execute, typically a 3-element array
+                [steering, gas, brake] for continuous control.
+
+        Returns:
+            tuple: A tuple containing:
+                - processed_obs (np.ndarray): The processed observation with shape (84, 96, 1).
+                - reward (float): The modified reward after applying custom shaping.
+                - done (bool): Whether the episode has ended (terminal state).
+                - truncated (bool): Whether the episode was truncated (time limit/early stop).
+                - info (dict): Auxiliary diagnostic information from the environment.
+        """
         observation, reward, done, truncated, info = self.env.step(action)
         
         # Process Visuals
@@ -201,9 +314,8 @@ class CustomEnvironment(gym.Wrapper):
         car = self.env.unwrapped.car
         speed = np.linalg.norm(car.hull.linearVelocity)
 
-        # 1. Wake up call: Penalty for not moving
+        # Track still and offroad steps for early stopping
         if speed < cfg.STILL_SPEED_THRESHOLD:
-            reward -= cfg.STILL_PENALTY
             self.consecutive_still_steps += 1
         else:
             self.consecutive_still_steps = 0
@@ -215,14 +327,21 @@ class CustomEnvironment(gym.Wrapper):
         else:
             self.consecutive_offroad_steps = 0
         
-        # 2. Timeout if stuck
+        # Early stopping if stuck (but no reward penalty when use_additional_rewards=False)
         if self.consecutive_still_steps > cfg.MAX_STILL_STEPS:
             truncated = True
-            reward -= cfg.TRUNCATION_PENALTY # Punishment for giving up
-            
-        # 3. Completion Bonus
-        if info.get("lap_finished"):
-             reward += cfg.LAP_FINISH_BONUS
+            if self.use_additional_rewards:
+                reward -= cfg.TRUNCATION_PENALTY # Punishment for giving up
+        
+        # Apply reward modifications only if enabled
+        if self.use_additional_rewards:
+            # 1. Wake up call: Penalty for not moving
+            if speed < cfg.STILL_SPEED_THRESHOLD:
+                reward -= cfg.STILL_PENALTY
+                
+            # 2. Completion Bonus
+            if info.get("lap_finished"):
+                reward += cfg.LAP_FINISH_BONUS
 
         reward = self.apply_additional_rewards(action, reward)
         
@@ -231,6 +350,27 @@ class CustomEnvironment(gym.Wrapper):
         return processed_obs, reward, done, truncated, info
 
     def apply_additional_rewards(self, action, reward):   
+        """Calculates and applies auxiliary rewards and penalties.
+
+        Modifies the base environment reward based on the agent's behavior to encourage
+        optimal racing performance. The modifications include:
+        - Penalties for off-road driving (per wheel).
+        - Penalties for drifting (excessive lateral velocity).
+        - Penalties for wiggling (rapid steering changes).
+        - Penalties for sharp steering at high speeds.
+        - Rewards for staying close to the optimal racing line.
+        - Rewards for maintaining correct orientation relative to the track.
+        - Heavy penalties for driving backwards.
+
+        All reward weights are configured in config.py.
+
+        Args:
+            action (np.ndarray): The action taken in this step.
+            reward (float): The base reward from the environment.
+
+        Returns:
+            float: The modified reward after applying all auxiliary components.
+        """
         if not self.use_additional_rewards:
             return reward
 
@@ -298,6 +438,19 @@ class CustomEnvironment(gym.Wrapper):
         return reward
     
     def reset(self, **kwargs):
+        """Resets the environment to an initial state.
+
+        This method resets the wrapped environment and recalculates the optimal racing
+        line for the newly generated track. It also resets all internal counters.
+
+        Args:
+            **kwargs: Additional arguments passed to the wrapped environment's reset method.
+
+        Returns:
+            tuple: A tuple containing:
+                - processed_obs (np.ndarray): The initial processed observation with shape (84, 96, 1).
+                - info (dict): Auxiliary diagnostic information from the environment.
+        """
         observation, info = self.env.reset(**kwargs)
         self.consecutive_still_steps = 0
         self.consecutive_offroad_steps = 0
@@ -306,14 +459,55 @@ class CustomEnvironment(gym.Wrapper):
         return self.process_observation(observation), info
 
 class CustomRepeatWrapper(gym.Wrapper):
+    """A wrapper that repeats an action for a specified number of frames.
+
+    This is used to reduce the temporal resolution of the environment, allowing
+    the agent to make decisions less frequently while the physics simulation
+    advances multiple steps. This stabilizes training and improves sample efficiency
+    by reducing the effective action space complexity.
+
+    Attributes:
+        repeat (int): The number of times to repeat each action.
+    """
     def __init__(self, env, repeat=cfg.ACTION_REPEAT):
+        """Initialize the CustomRepeatWrapper.
+
+        Args:
+            env (gym.Env): The environment to wrap.
+            repeat (int, optional): Number of frames to repeat each action.
+                Defaults to cfg.ACTION_REPEAT (typically 2).
+        """
         super().__init__(env)
         self.repeat = repeat
 
     def reset(self, **kwargs):
+        """Resets the environment.
+
+        Args:
+            **kwargs: Additional arguments for the reset method.
+
+        Returns:
+            tuple: (observation, info) from the wrapped environment.
+        """
         return self.env.reset(**kwargs)
 
     def step(self, action):
+        """Executes the action repeatedly for `self.repeat` steps.
+
+        Accumulates rewards across the repeated steps. If the episode ends
+        during the repetition (terminated or truncated), the loop breaks early.
+
+        Args:
+            action (np.ndarray): The action to repeat for multiple frames.
+
+        Returns:
+            tuple: A tuple containing:
+                - obs (np.ndarray): The final observation after all repetitions.
+                - total_reward (float): The sum of rewards from all repeated steps.
+                - done (bool): Whether the episode terminated.
+                - truncated (bool): Whether the episode was truncated.
+                - info (dict): Info dictionary from the last step.
+        """
         total_reward = 0.0
         done = False
         truncated = False
@@ -330,12 +524,40 @@ class CustomRepeatWrapper(gym.Wrapper):
         return obs, total_reward, done, truncated, info
 
 def make_custom_env(render_mode="rgb_array", use_additional_rewards=True):
+    """Factory function to create a single instance of the custom environment.
+
+    Applies the `CustomEnvironment` and `CustomRepeatWrapper` wrappers to the base
+    CarRacing-v3 environment, and wraps the result in a `Monitor` for episode logging.
+
+    Args:
+        render_mode (str, optional): Rendering mode for the environment. Defaults to "rgb_array".
+        use_additional_rewards (bool, optional): Whether to enable custom reward shaping.
+            Defaults to True.
+
+    Returns:
+        gym.Env: The fully configured environment instance ready for training or evaluation.
+    """
     env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=True)
     custom_env = CustomEnvironment(env, use_additional_rewards=use_additional_rewards)
     custom_env_repeat = CustomRepeatWrapper(custom_env)
     return Monitor(custom_env_repeat)
 
 def make_vec_envs(num_envs=cfg.NUM_ENVS_LOW, use_additional_rewards=True):
+    """Factory function to create vectorized environments for parallel training.
+
+    Uses `SubprocVecEnv` to run multiple environment instances in separate processes,
+    enabling parallel data collection and significantly speeding up training.
+
+    Args:
+        num_envs (int, optional): Number of parallel environments to create.
+            Defaults to cfg.NUM_ENVS_LOW (typically 4).
+        use_additional_rewards (bool, optional): Whether to enable custom reward shaping
+            in all environments. Defaults to True.
+
+    Returns:
+        stable_baselines3.common.vec_env.SubprocVecEnv: The vectorized environment wrapper
+            containing `num_envs` parallel environment instances.
+    """
     return make_vec_env(
         lambda: make_custom_env(use_additional_rewards=use_additional_rewards),
         n_envs=num_envs,

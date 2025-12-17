@@ -1,3 +1,19 @@
+"""Fine-tuning script for training without line-following rewards.
+
+Loads a pre-trained model and continues training with line distance/angle rewards
+disabled. Agent relies solely on tile completion, still penalty, and lap bonuses.
+
+Usage:
+    ```bash
+    python train_no_line.py <model_path> [timesteps]
+    python train_no_line.py models/phased/phase_3/best_model/best_model.zip 500000
+    ```
+
+Args:
+    model_path: Path to pre-trained model checkpoint
+    timesteps: Optional training steps (default: 500,000)
+"""
+
 import gymnasium as gym
 from customization import make_vec_envs
 from learning import Driver
@@ -8,10 +24,20 @@ import os
 import sys
 
 def main():
-    """
-    Train a model without line-following rewards.
-    Loads a pre-trained model and continues training with line rewards disabled.
-    This allows the agent to rely purely on tile completion and basic penalties.
+    """Load pre-trained model and continue training without line rewards.
+    
+    Disables line_distance_reward and line_angle_reward on both training and
+    evaluation environments, forcing the agent to rely on native tile-based
+    rewards. Useful for testing if line-following rewards are necessary.
+    
+    CLI Args:
+        sys.argv[1]: Path to pre-trained model (required)
+        sys.argv[2]: Training timesteps (optional, default: 500,000)
+    
+    Outputs:
+        Checkpoints: ./models/no_line/checkpoints/
+        Best model: ./models/no_line/best_model/
+        Logs: ./logs/ppo_no_line/
     """
     
     # Check if model path provided

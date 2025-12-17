@@ -1,3 +1,17 @@
+"""Resume training script for interrupted training runs.
+
+Automatically finds the latest valid checkpoint, validates zip integrity,
+calculates remaining steps, and continues training to completion.
+
+Usage:
+    ```bash
+    python resume_training.py
+    ```
+
+Note:
+    Skips corrupted checkpoints (<1KB or invalid zip) and uses the latest valid one.
+"""
+
 import gymnasium as gym
 from customization import make_vec_envs
 from learning import Driver
@@ -9,7 +23,22 @@ import glob
 import re
 
 def find_latest_checkpoint(checkpoint_dir):
-    """Find the latest valid checkpoint in the directory"""
+    """Find the latest valid checkpoint with zip integrity validation.
+    
+    Filters out corrupted checkpoints (<1KB or invalid zip) and returns
+    the most recent valid checkpoint by modification time.
+    
+    Args:
+        checkpoint_dir (str): Directory containing checkpoint files.
+    
+    Returns:
+        tuple: (checkpoint_path, steps_completed) where checkpoint_path is
+            the full path to the latest valid checkpoint and steps_completed
+            is the number of steps extracted from the filename.
+    
+    Raises:
+        FileNotFoundError: If no valid checkpoints are found.
+    """
     import zipfile
     
     checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "ppo_model_*_steps.zip"))
@@ -51,6 +80,20 @@ def find_latest_checkpoint(checkpoint_dir):
     return latest_checkpoint, steps_completed
 
 def main():
+    """Resume training from the latest valid checkpoint.
+    
+    Finds the most recent valid checkpoint, calculates remaining steps to reach
+    TARGET_TIMESTEPS, loads the model, and continues training with the same
+    configuration. Sets reset_num_timesteps=False to preserve training statistics.
+    
+    Workflow:
+        1. Find and validate latest checkpoint
+        2. Calculate remaining steps (TARGET_TIMESTEPS - steps_completed)
+        3. Create environments and load model
+        4. Resume training with Driver
+    
+    Exits early if training is already complete or no checkpoints found.
+    """
     # Target timesteps to reach
     TARGET_TIMESTEPS = cfg.TOTAL_TIMESTEPS / cfg.ACTION_REPEAT
     
