@@ -19,7 +19,7 @@ TRAINING_PHASES = [
         # === PHASE 1: EXPLORATION ===
         # lenient line following, high offroad tolerance, low target speed
         "name": "phase_1_exploration",
-        "timesteps": 1_500_000 * ACTION_REPEAT,
+        "timesteps": 2_000_000 * ACTION_REPEAT,
         "description": "Initial exploration - encourage movement and track following",
         
         # Reward weights for this phase
@@ -41,7 +41,8 @@ TRAINING_PHASES = [
             "DRIFT_THRESHOLD": 0.0,
             "WIGGLE_PENALTY": 0.03,
             "WIGGLE_THRESHOLD": 0.3,
-            "TARGET_SPEED": 10.0, # Was 25.0 -> 10.0
+            "HIGH_SPEED_STEERING_PENALTY": 0.05,  # Penalty for steering at high speeds
+            "TARGET_SPEED": 5.0, # Was 25.0 -> 10.0 -> 5.0
         },
         
         # PPO parameters for this phase
@@ -62,7 +63,7 @@ TRAINING_PHASES = [
         # === PHASE 2: REFINEMENT ===
         # tighter line following, moderate offroad tolerance, moderate target speed
         "name": "phase_2_refinement",
-        "timesteps": 2_000_000 * ACTION_REPEAT,
+        "timesteps": 1_500_000 * ACTION_REPEAT,
         "description": "Refinement - focus on optimal line and speed",
         
         "rewards": {
@@ -73,17 +74,18 @@ TRAINING_PHASES = [
             "MAX_OFFROAD_STEPS": 400,
             "TRUNCATION_PENALTY": 5.0,
             "OFFROAD_WHEEL_PENALTY": 0.13, # Was 0.08 -> 0.13
-            "MAX_LINE_DISTANCE_REWARD": 0.25,
+            "MAX_LINE_DISTANCE_REWARD": 0.125,
             "LINE_DISTANCE_DECAY": 5.0,
             "LINE_SAFE_DISTANCE": 2.0, # New: starts at 2.0
-            "MAX_LINE_ANGLE_REWARD": 0.5,
+            "MAX_LINE_ANGLE_REWARD": 0.25,
             "LINE_ANGLE_DECAY": 0.2,
             "LINE_SAFE_ANGLE": 0.26, # New: starts at 0.26 (15 deg)
             "DRIFT_PENALTY": 0.025,
             "DRIFT_THRESHOLD": 0.0,
             "WIGGLE_PENALTY": 0.05,
             "WIGGLE_THRESHOLD": 0.3,
-            "TARGET_SPEED": 15.0, # Was 25.0 -> 15.0
+            "HIGH_SPEED_STEERING_PENALTY": 0.08,  # Increased for refinement phase
+            "TARGET_SPEED": 10.0, # Was 25.0 -> 15.0 -> 10.0
         },
         
         "ppo_params": {
@@ -114,17 +116,18 @@ TRAINING_PHASES = [
             "MAX_OFFROAD_STEPS": 300,   # Stricter offroad tolerance
             "TRUNCATION_PENALTY": 10.0,  # Higher penalty for failures
             "OFFROAD_WHEEL_PENALTY": 0.2, # Was 0.13 -> 0.2
-            "MAX_LINE_DISTANCE_REWARD": 0.12,
+            "MAX_LINE_DISTANCE_REWARD": 0.0,
             "LINE_DISTANCE_DECAY": 4.0,
             "LINE_SAFE_DISTANCE": 1.5, # New: starts at 1.5
-            "MAX_LINE_ANGLE_REWARD": 0.35,
+            "MAX_LINE_ANGLE_REWARD": 0.05,
             "LINE_ANGLE_DECAY": 0.2,
             "LINE_SAFE_ANGLE": 0.09, # New: starts at 0.09 (5 deg)
             "DRIFT_PENALTY": 0.025,
             "DRIFT_THRESHOLD": 0.0,
             "WIGGLE_PENALTY": 0.09,
             "WIGGLE_THRESHOLD": 0.25,
-            "TARGET_SPEED": 25.0,  # Was 40.0 -> 25.0
+            "HIGH_SPEED_STEERING_PENALTY": 0.15,  # Highest for mastery phase
+            "TARGET_SPEED": 15.0,  # Was 40.0 -> 25.0 -> 15.0
         },
         
         "ppo_params": {
@@ -172,7 +175,9 @@ DRIFT_PENALTY = 0.02
 DRIFT_THRESHOLD = 0.0             
 
 WIGGLE_PENALTY = 0.05             
-WIGGLE_THRESHOLD = 0.3           
+WIGGLE_THRESHOLD = 0.3
+
+HIGH_SPEED_STEERING_PENALTY = 0.08  # Penalty for steering at high speeds (abs(steering) * speed)
 
 TARGET_SPEED = 25.0  # Was 50.0 -> 25.0           
 
@@ -224,7 +229,7 @@ def apply_phase_config(phase_idx):
     global MAX_LINE_DISTANCE_REWARD, LINE_DISTANCE_DECAY, LINE_SAFE_DISTANCE
     global MAX_LINE_ANGLE_REWARD, LINE_ANGLE_DECAY, LINE_SAFE_ANGLE
     global DRIFT_PENALTY, DRIFT_THRESHOLD, WIGGLE_PENALTY, WIGGLE_THRESHOLD
-    global TARGET_SPEED, ACTIVE_PHASE
+    global HIGH_SPEED_STEERING_PENALTY, TARGET_SPEED, ACTIVE_PHASE
     
     phase = get_phase_config(phase_idx)
     rewards = phase["rewards"]
@@ -247,6 +252,7 @@ def apply_phase_config(phase_idx):
     DRIFT_THRESHOLD = rewards["DRIFT_THRESHOLD"]
     WIGGLE_PENALTY = rewards["WIGGLE_PENALTY"]
     WIGGLE_THRESHOLD = rewards["WIGGLE_THRESHOLD"]
+    HIGH_SPEED_STEERING_PENALTY = rewards.get("HIGH_SPEED_STEERING_PENALTY", 0.08)
     TARGET_SPEED = rewards["TARGET_SPEED"]
     
     ACTIVE_PHASE = phase_idx

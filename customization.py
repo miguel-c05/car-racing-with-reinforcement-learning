@@ -10,7 +10,8 @@ import cv2
 class CustomEnvironment(gym.Wrapper):
     def __init__(self, env, use_additional_rewards=True, offroad_penalty=False,
                  line_distance_reward=False, line_angle_reward=False,
-                 drift_penalty=False, wiggle_penalty=False):
+                 drift_penalty=False, wiggle_penalty=False, fast_steering_penalty=False,
+                 cap_bell_curves=False):
         super().__init__(env)
         self.env = env
         self.use_additional_rewards = use_additional_rewards
@@ -19,6 +20,8 @@ class CustomEnvironment(gym.Wrapper):
         self.line_angle_reward = line_angle_reward
         self.drift_penalty = drift_penalty
         self.wiggle_penalty = wiggle_penalty
+        self.fast_steering_penalty = fast_steering_penalty
+        self.cap_bell_curves = cap_bell_curves
         
         if self.use_additional_rewards:
             self.offroad_penalty = True
@@ -26,6 +29,8 @@ class CustomEnvironment(gym.Wrapper):
             self.line_angle_reward = True
             self.drift_penalty = True
             self.wiggle_penalty = True
+            self.fast_steering_penalty = True
+            self.cap_bell_curves = True
             
         # Cropped Observation Space (84x96)
         original_shape = self.env.observation_space.shape
@@ -249,6 +254,14 @@ class CustomEnvironment(gym.Wrapper):
             if wiggle > cfg.WIGGLE_THRESHOLD:
                 reward -= cfg.WIGGLE_PENALTY * steering
         
+        # High-speed steering penalty: penalize sharp steering at high speeds
+        # This teaches the agent that high speed requires gentle steering
+        steering = abs(action[0])
+        if self.fast_steering_penalty and steering > 0.1:  # Only penalize if actually steering
+            speed_factor = min(speed / cfg.TARGET_SPEED, 1.0)
+            high_speed_steering_penalty = cfg.HIGH_SPEED_STEERING_PENALTY * steering * speed_factor
+            reward -= high_speed_steering_penalty
+        
         if self.line_distance_reward or self.line_angle_reward:
             line_distance, angle_diff, closest_idx, is_backwards = self.get_line_distance_and_angle_diff()
             
@@ -256,7 +269,7 @@ class CustomEnvironment(gym.Wrapper):
             # This prevents the agent from exploiting the tile reward by going backwards
             if is_backwards:
                 # Scale penalty with speed - faster backwards = worse penalty
-                backwards_penalty = cfg.MAX_LINE_DISTANCE_REWARD + (cfg.MAX_LINE_ANGLE_REWARD * 2.0)
+                backwards_penalty = (cfg.MAX_LINE_DISTANCE_REWARD + cfg.MAX_LINE_ANGLE_REWARD) * 2.0
                 reward -= backwards_penalty * min(speed / cfg.TARGET_SPEED, 1.5)
             else:
                 # Only give rewards if going in the correct direction
